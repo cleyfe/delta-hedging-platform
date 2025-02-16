@@ -283,7 +283,7 @@ class DeltaHedger:
             except (ValueError, TypeError):
                 return {"error": "Invalid numeric values in settings"}
 
-            if settings["min_hedge_size"] <= 0:
+            if settings["min_hedge_size"] < 0:
                 return {"error": "min_hedge_size must be positive"}
             if settings["max_hedge_size"] <= settings["min_hedge_size"]:
                 return {"error": "max_hedge_size must be greater than min_hedge_size"}

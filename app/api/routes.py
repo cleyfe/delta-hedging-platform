@@ -1,5 +1,6 @@
 # app/api/routes.py
 import logging
+import os
 from datetime import datetime
 from http import HTTPStatus
 from typing import Dict, List, Optional, Tuple, Union
@@ -9,7 +10,7 @@ from flask import Response, jsonify, render_template, request
 from app import app
 from app.core.delta_hedger import DeltaHedger
 from app.models.position import Position
-from app.services.ig_client import IGClient
+from app.services.ig_client import IGClient, IGAPIError
 from config.settings import HEDGE_SETTINGS as _hedge_settings
 
 # Type alias for Flask responses
@@ -18,8 +19,22 @@ logger = logging.getLogger(__name__)
 
 # Initialize clients with proper error handling
 try:
-    ig_client = IGClient()  # Using real client
+    # Initialize
+    ig_client = IGClient(
+        api_key=os.getenv("IG_API_KEY"),
+        username=os.getenv("IG_USERNAME"),
+        password=os.getenv("IG_PASSWORD")
+    )
+    
+    # Explicitly login after initialization
+    if not ig_client.login():
+        logger.critical("Failed to login to IG API")
+        raise IGAPIError("Failed to login to IG API")
+        
     hedger = DeltaHedger(ig_client)
+except IGAPIError as e:
+    logger.critical(f"IG API Error: {str(e)}")
+    raise
 except Exception as e:
     logger.critical(f"Failed to initialize clients: {str(e)}")
     raise
@@ -40,6 +55,11 @@ def index() -> str:
     """Render main application page"""
     return render_template("index.html")
 
+@app.route("/config")
+def get_config():
+    return jsonify({
+        "apiBaseUrl": os.getenv("API_BASE_URL", "http://localhost:8000/api")
+    })
 
 @app.route("/api/monitor/start", methods=["POST"])
 def start_monitoring() -> ApiResponse:
@@ -79,7 +99,7 @@ def start_monitoring() -> ApiResponse:
 
 
 @app.route("/api/positions", methods=["GET"])
-def list_positions() -> ApiResponse:
+def fetch_positions() -> ApiResponse:
     try:
         positions_response = ig_client.get_positions()
         if "error" in positions_response:
@@ -260,44 +280,40 @@ def get_hedge_status() -> ApiResponse:
         return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
 
 
-@app.route("/api/settings", methods=["GET", "POST"])
+@app.route("/api/settings", methods=["GET", "POST", "PUT"])
 def handle_settings() -> ApiResponse:
     """Handle hedging settings"""
     try:
-        if request.method == "POST":
+        if request.method in ["POST", "PUT"]:  # Handle both POST and PUT
             data = validate_json_request()
             if not data:
-                return (
-                    jsonify({"error": "Invalid request data"}),
-                    HTTPStatus.BAD_REQUEST,
-                )
+                return jsonify({"error": "Invalid request data"}), HTTPStatus.BAD_REQUEST
+                
             validation_result = hedger.validate_settings(data)
 
             if "error" in validation_result:
                 return jsonify(validation_result), HTTPStatus.BAD_REQUEST
 
             updated_settings = hedger.get_current_settings()
-            return jsonify(
-                {
-                    "message": "Settings updated successfully",
-                    "settings": updated_settings,
-                }
-            )
+            return jsonify({
+                "message": "Settings updated successfully",
+                "settings": updated_settings,
+            })
 
         # GET request
         current_settings = hedger.get_current_settings()
         monitoring_status = hedger.get_monitoring_status()
 
-        return jsonify(
-            {"settings": current_settings, "monitoring_status": monitoring_status}
-        )
+        return jsonify({
+            "settings": current_settings, 
+            "monitoring_status": monitoring_status
+        })
 
     except ValueError as e:
         return jsonify({"error": str(e)}), HTTPStatus.BAD_REQUEST
     except Exception as e:
         logger.error(f"Error handling settings: {str(e)}")
         return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
-
 
 @app.route("/api/analytics/<position_id>", methods=["GET"])
 def get_position_analytics(position_id: str) -> ApiResponse:
@@ -391,7 +407,7 @@ def hedge_all_positions() -> ApiResponse:
         logger.error(f"Error hedging all positions: {str(e)}")
         return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
 
-
+'''
 @app.route("/api/positions/sold", methods=["GET"])
 def get_sold_positions() -> ApiResponse:
     """Get all sold positions"""
@@ -411,3 +427,4 @@ def get_sold_positions() -> ApiResponse:
     except Exception as e:
         logger.error(f"Error getting sold positions: {str(e)}")
         return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
+'''

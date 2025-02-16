@@ -60,7 +60,7 @@ IG_ACC_TYPE=DEMO/LIVE
 
 ```bash
 # Run the Flask development server
-python app.py
+python main.py
 ```
 
 ### Frontend (Web Dashboard)

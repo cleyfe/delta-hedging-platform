@@ -14,27 +14,34 @@ from config.settings import HEDGE_SETTINGS as _hedge_settings
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+class IGAPIError(Exception):
+    def __init__(self, message, status_code=None, response_text=None):
+        self.message = message
+        self.status_code = status_code
+        self.response_text = response_text
+        super().__init__(self.message)
+
+    def __str__(self):
+        error_msg = self.message
+        if self.status_code:
+            error_msg += f" (Status: {self.status_code})"
+        if self.response_text:
+            error_msg += f" Response: {self.response_text}"
+        return error_msg
 
 class IGClient:
-    def __init__(self):
+    def __init__(self, api_key, username, password):
         """Initialize IGClient with configuration"""
-        self.session = requests.Session()
-        self.base_url = "https://demo-api.ig.com/gateway/deal"
-
         # API credentials
-        self.api_key = os.getenv("IG_API_KEY")
-        self.username = os.getenv("IG_USERNAME")
-        self.password = os.getenv("IG_PASSWORD")
-        self.acc_type = os.getenv("IG_ACC_TYPE", "DEMO")
-        self.options_account = os.getenv("IG_OPTIONS_ACCOUNT")
-        self.cfd_account = os.getenv("IG_CFD_ACCOUNT")
-        self.account_id = self.options_account
-        logger.info(f"Initializing IG Client with account ID: {self.account_id}")
-
-        # Authentication tokens
-        self.security_token: Optional[str] = None
-        self.cst: Optional[str] = None
-        self.token_expiry: Optional[datetime] = None
+        self.api_key = api_key
+        self.username = username
+        self.password = password
+        self.base_url = "https://demo-api.ig.com/gateway/deal"
+        self.session = requests.Session()
+        self.account_id = None
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expiry = None
 
         # Rate limiting
         self.request_delay = 1.0
@@ -42,8 +49,7 @@ class IGClient:
         self.max_retries = 3
         self.retry_delay = 2
         self.request_interval = float(_hedge_settings.get("api_request_interval", 1.0))
-        print(f"Options Account: {os.getenv('IG_OPTIONS_ACCOUNT')}")
-        print(f"CFD Account: {os.getenv('IG_CFD_ACCOUNT')}")
+        
         self.login()
 
     def _validate_credentials(self) -> None:
@@ -55,11 +61,45 @@ class IGClient:
             missing.append("IG_USERNAME")
         if not self.password:
             missing.append("IG_PASSWORD")
-        if not self.account_id:
-            missing.append("IG_OPTIONS_ACCOUNT")
 
         if missing:
             raise ValueError(f"Missing IG API credentials: {', '.join(missing)}")
+
+    def refresh_access_token(self) -> bool:
+        """Refresh the access token using the refresh token"""
+        if not self.refresh_token:
+            logger.error("No refresh token available")
+            return False
+
+        headers = {
+            "X-IG-API-KEY": self.api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json; charset=UTF-8",
+            "Version": "1"
+        }
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/session/refresh-token",
+                headers=headers,
+                json={"refresh_token": self.refresh_token}
+            )
+
+            if response.status_code == 200:
+                response_data = response.json()
+                self.access_token = response_data.get('access_token')
+                self.refresh_token = response_data.get('refresh_token')
+                expires_in = int(response_data.get('expires_in', 0))
+                self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
+                logger.info("Successfully refreshed access token")
+                return True
+            else:
+                logger.error(f"Failed to refresh token: {response.status_code}")
+                return False
+        except Exception as e:
+            logger.error(f"Error refreshing token: {str(e)}")
+            return False
+
 
     def _handle_rate_limit(self, response: requests.Response) -> bool:
         """Handle rate limiting errors"""
@@ -96,204 +136,150 @@ class IGClient:
         except Exception as e:
             logger.error(f"Error handling response for {operation}: {str(e)}")
             return {"error": str(e)}
+        
+    def ensure_token_valid(self):
+        """Ensure the access token is valid, refresh if needed"""
+        if not self.token_expiry or not self.access_token:
+            raise IGAPIError("No valid session - needs new login")
 
-    def _check_token_expiry(self) -> bool:
-        """Check if authentication token needs refresh"""
-        if not self.token_expiry:
-            return True
-        return datetime.now() >= self.token_expiry
+        # Refresh if token expires in less than 15 seconds
+        if datetime.now() + timedelta(seconds=15) >= self.token_expiry:
+            logger.info("Token expiring soon, attempting refresh...")
+            success = self.refresh_access_token()
+            if not success:
+                self.access_token = None
+                self.refresh_token = None
+                self.token_expiry = None
+                raise IGAPIError("Session expired - needs new login")
 
-    def login(self, account_type: str = "options") -> bool:
+    def login(self):
+        """Authenticate with the IG API"""
+        
         try:
-            # Determine the appropriate account ID
-            if account_type == "options":
-                self.account_id = os.getenv("IG_OPTIONS_ACCOUNT")
-            elif account_type == "cfd":
-                self.account_id = os.getenv("IG_CFD_ACCOUNT")
-            else:
-                raise ValueError(f"Invalid account type: {account_type}")
-
-            logger.debug(f"Attempting login with account type: {account_type}")
-            logger.debug(f"Using account ID: {self.account_id}")
-
             self._validate_credentials()
-
+            
             headers = {
                 "X-IG-API-KEY": self.api_key,
-                "Version": "2",
                 "Content-Type": "application/json",
-            }
-
-            data = {
-                "identifier": self.username,
-                "password": self.password,
-                "encryptedPassword": False,
+                "Accept": "application/json; charset=UTF-8",
+                "Version": "3"
             }
 
             response = self.session.post(
-                f"{self.base_url}/session", headers=headers, json=data, timeout=30
+                f"{self.base_url}/session",
+                headers=headers,
+                json={"identifier": self.username, "password": self.password}
             )
 
-            logger.debug(f"Login response status: {response.status_code}")
-            logger.debug(f"Login response headers: {dict(response.headers)}")
-            logger.debug(f"Login response body: {response.text}")
+            logger.info(f"Login response status: {response.status_code}")
+            logger.info(f"Login response body: {response.text}")
 
             if response.status_code == 200:
-                self.security_token = response.headers.get("X-SECURITY-TOKEN")
-                self.cst = response.headers.get("CST")
-                self.token_expiry = datetime.now() + timedelta(hours=6)
-
-                logger.info(f"Successfully logged in with account {self.account_id}")
-
-                # Get available accounts
-                accounts_response = self.session.get(
-                    f"{self.base_url}/accounts", headers=self.get_headers(), timeout=30
-                )
-
-                if accounts_response.status_code == 200:
-                    accounts = accounts_response.json().get("accounts", [])
-                    logger.debug(f"Available accounts: {accounts}")
-                    logger.debug(f"Trying to match account ID: {self.account_id}")
-
-                    matching_account = next(
-                        (
-                            acc
-                            for acc in accounts
-                            if acc.get("accountId") == self.account_id
-                        ),
-                        None,
-                    )
-
-                    if matching_account:
-                        logger.debug(f"Found matching account: {matching_account}")
-                        switch_response = self.session.put(
-                            f"{self.base_url}/session",
-                            headers=self.get_headers(),
-                            json={"accountId": self.account_id},
-                            timeout=30,
-                        )
-
-                        logger.debug(
-                            f"Switch response status: {switch_response.status_code}"
-                        )
-                        logger.debug(f"Switch response body: {switch_response.text}")
-
-                        if switch_response.status_code in [200, 204]:
-                            logger.info(
-                                f"Successfully set account to {self.account_id}"
-                            )
-                        else:
-                            logger.warning(
-                                f"Could not set account. Status: {switch_response.status_code}"
-                            )
-                    else:
-                        logger.warning(
-                            f"Account {self.account_id} not found in available accounts: {accounts}"
-                        )
-
+                response_data = response.json()
+                self.account_id = response_data.get('accountId')
+                oauth_token = response_data.get('oauthToken', {})
+                self.access_token = oauth_token.get('access_token')
+                self.refresh_token = oauth_token.get('refresh_token')
+                expires_in = int(oauth_token.get('expires_in', 0))
+                self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
+                logger.info("Successfully authenticated with IG API")
                 return True
 
-            logger.error(f"Login failed: {response.text}")
-            return False
+            elif response.status_code == 401:
+                logger.error("Authentication failed - invalid credentials")
+                raise IGAPIError("Invalid credentials provided")
+            else:
+                logger.error(f"Authentication failed with status code: {response.status_code}")
+                raise IGAPIError("Failed to authenticate with IG API")
 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Login request error: {str(e)}")
-            return False
+            logger.error(f"Network error during authentication: {str(e)}")
+            raise IGAPIError("Network error occurred while connecting to IG API")
         except Exception as e:
-            logger.error(f"Login error: {str(e)}")
-            return False
+            logger.error(f"Unexpected error during authentication: {str(e)}")
+            raise IGAPIError("An unexpected error occurred during authentication")
 
-    def _process_position_data(self, position_data: Dict) -> Dict:
-        try:
-            market_data = position_data.get("market", {})
-            position = position_data.get("position", {})
-
-            # Enhanced option type detection
-            instrument_name = market_data.get("instrumentName", "").upper()
-            if "PUT" in instrument_name:
-                option_type = "PUT"
-            elif "CALL" in instrument_name:
-                option_type = "CALL"
-            else:
-                option_type = "CALL"
-
-            market_data["instrumentType"] = option_type
-            market_data["strikePrice"] = float(market_data.get("strikePrice", 0))
-            market_data["contractSize"] = float(position.get("contractSize", 1.0))
-
-            # Add calculated fields
-            position["totalSize"] = float(position.get("size", 0)) * float(
-                position.get("contractSize", 1.0)
-            )
-            position["currentValue"] = position["totalSize"] * float(
-                market_data.get(
-                    "offer" if position.get("direction") == "BUY" else "bid", 0
-                )
-            )
-
-            return {"position": position, "market": market_data}
-
-        except Exception as e:
-            logger.error(f"Position data processing error: {str(e)}")
-            return position_data
+    def get_headers(self, version: str = "2") -> Dict:
+        """Get headers for API requests"""
+        self.ensure_token_valid()
+        
+        return {
+            "X-IG-API-KEY": self.api_key,
+            "Authorization": f"Bearer {self.access_token}",
+            "IG-ACCOUNT-ID": self.account_id,
+            "Content-Type": "application/json",
+            "Accept": "application/json; charset=UTF-8",
+            "Version": version
+        }
 
     def get_positions(self) -> Dict:
-
+        """Fetch current positions"""
         try:
-            logger.info(f"Fetching positions for account: {self.account_id}")
+            # First ensure token is valid
+            self.ensure_token_valid()
+            if not self.access_token:
+                raise IGAPIError("Not authenticated - please log in first")
 
-            if self._check_token_expiry():
-                if not self.login():
-                    return {"error": "Failed to refresh authentication"}
-
-            # Get positions list
+            # Make the request
             response = self.session.get(
-                f"{self.base_url}/positions", headers=self.get_headers(), timeout=30
+                f"{self.base_url}/positions",
+                headers=self.get_headers(version="1"),  # Note we're using version 1 here
+                timeout=30
             )
 
-            positions_data = self._handle_response(response, "Get positions")
-            if "error" in positions_data:
-                return positions_data
+            logger.debug(f"Position response status: {response.status_code}")
+            logger.debug(f"Position response text: {response.text}")
 
-            # Process each position
-            processed_positions = []
-            for position in positions_data.get("positions", []):
-                try:
-                    # Process and validate position data
-                    processed_position = self._process_position_data(position)
-                    processed_positions.append(processed_position)
-                except Exception as e:
-                    logger.error(f"Error processing position: {str(e)}")
-                    continue
-
-            positions_data["positions"] = processed_positions
-
-            # Log position count
-            position_count = len(processed_positions)
-            logger.info(
-                f"Found {position_count} positions for account {self.account_id}"
-            )
-
-            return positions_data
+            if response.status_code == 200:
+                logger.info("Successfully fetched positions")
+                return response.json()
+            elif response.status_code == 401:
+                # Clear tokens and raise error
+                self.access_token = None
+                self.refresh_token = None
+                self.token_expiry = None
+                raise IGAPIError(
+                    message="Session expired - needs new login",
+                    status_code=response.status_code,
+                    response_text=response.text
+                )
+            else:
+                logger.error(f"Failed to fetch positions: HTTP {response.status_code}")
+                raise IGAPIError(
+                    message="Failed to fetch positions from IG API",
+                    status_code=response.status_code,
+                    response_text=response.text
+                )
 
         except requests.exceptions.RequestException as e:
-            error_msg = (
-                f"Failed to get positions for account {self.account_id}: {str(e)}"
-            )
-            logger.error(error_msg)
-            return {"error": error_msg}
-
+            logger.error(f"Network error while fetching positions: {str(e)}")
+            raise IGAPIError(f"Network error occurred while fetching positions: {str(e)}")
+        except IGAPIError:
+            raise  # Re-raise IGAPIError as is
+        except Exception as e:
+            logger.error(f"Unexpected error while fetching positions: {str(e)}")
+            raise IGAPIError(f"An unexpected error occurred while fetching positions: {str(e)}")
+    
     def get_market_data(self, epic: str) -> Dict:
+        """
+        Fetch details for a specific market by its epic code
+
+        Args:
+            epic: The epic identifier for the market
+
+        Returns:
+            dict: Market details including price, volatility, etc.
+        """
         try:
             self._rate_limit()
-            if self._check_token_expiry():
-                if not self.login():
-                    return {"error": "Failed to refresh authentication"}
+            self.ensure_token_valid()
+            
+            if not self.access_token:
+                raise IGAPIError("Not authenticated - please log in first")
 
             response = self.session.get(
                 f"{self.base_url}/markets/{epic}",
-                headers=self.get_headers(version="3"),
-                timeout=30,
+                headers=self.get_headers(version="3")
             )
 
             if response.status_code == 200:
@@ -301,35 +287,37 @@ class IGClient:
                 snapshot = data.get("snapshot", {})
                 instrument = data.get("instrument", {})
 
+                # Process the data like in the original
                 market_data = {
                     "bid": float(snapshot.get("bid", 0)),
                     "offer": float(snapshot.get("offer", 0)),
-                    "price": (
-                        float(snapshot.get("bid", 0)) + float(snapshot.get("offer", 0))
-                    )
-                    / 2,
+                    "price": (float(snapshot.get("bid", 0)) + float(snapshot.get("offer", 0))) / 2,
                     "high": float(snapshot.get("high", 0)),
                     "low": float(snapshot.get("low", 0)),
                     "update_time": snapshot.get("updateTime"),
-                    "volatility": max(
-                        0.001, abs(float(snapshot.get("percentageChange", 0.1)) / 100)
-                    ),
+                    "volatility": max(0.001, abs(float(snapshot.get("percentageChange", 0.1)) / 100)),
                     "instrument_type": instrument.get("type", ""),
                     "market_status": snapshot.get("marketStatus", ""),
                     "strike_price": float(instrument.get("strikePrice", 0)),
                     "expiry": instrument.get("expiry", ""),
                 }
-
+                
+                logger.info(f"Successfully fetched market data for {epic}")
                 return market_data
-
-            error_msg = self._parse_error_response(response)
-            logger.error(f"Failed to get market data for {epic}: {error_msg}")
-            return {"error": error_msg}
-
+                
+            elif response.status_code == 401:
+                raise IGAPIError("Session expired - please log in again")
+            else:
+                raise IGAPIError(f"Failed to fetch market details from IG API: HTTP {response.status_code}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error while fetching market details: {str(e)}")
+            raise IGAPIError(f"Network error occurred while fetching market details: {str(e)}")
+        except IGAPIError:
+            raise
         except Exception as e:
-            error_msg = f"Market data error for {epic}: {str(e)}"
-            logger.error(error_msg)
-            return {"error": error_msg}
+            logger.error(f"Unexpected error while fetching market details: {str(e)}")
+            raise IGAPIError(f"An unexpected error occurred while fetching market details: {str(e)}")
 
     def create_position(
         self,
@@ -472,21 +460,6 @@ class IGClient:
             time.sleep(self.request_interval - elapsed)
 
         self.last_request_time = time.time()
-
-    def get_headers(self, version: str = "2") -> Dict:
-        """Get headers for API requests"""
-        if not self.security_token or not self.cst:
-            if not self.login():
-                raise Exception("Failed to authenticate with IG API")
-
-        return {
-            "X-IG-API-KEY": self.api_key,
-            "X-SECURITY-TOKEN": self.security_token,
-            "CST": self.cst,
-            "Version": version,
-            "Content-Type": "application/json",
-            "Accept": "application/json; charset=UTF-8",
-        }
 
     def create_hedge_position(
         self, epic: str, direction: OrderDirection, size: float

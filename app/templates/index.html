@@ -158,11 +158,13 @@
                         <h2 class="text-xl font-semibold mb-4">Position Management</h2>
                         <div class="space-y-3">
                             <button id="listPositionsBtn" class="w-full bg-green-500 text-white p-2 rounded hover:bg-green-600 transition">
-                                List All Positions
+                                Fetch All Positions
                             </button>
+                            <!--
                             <button id="getSoldPositionsBtn" class="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-600 transition">
                                 Get Sold Positions
                             </button>
+                            -->
                             <div class="flex space-x-2">
                                 <input type="text" id="positionId" placeholder="Position ID" class="flex-1 p-2 border rounded">
                                 <button id="getPositionBtn" class="bg-indigo-500 text-white px-4 py-2 rounded hover:bg-indigo-600 transition">
@@ -306,7 +308,20 @@
 
     <script>
     // Configuration
-    const BASE_URL = 'http://13.60.29.20/api';
+    let BASE_URL;
+
+    async function initializeConfig() {
+        try {
+            const response = await fetch('/config');
+            const config = await response.json();
+            BASE_URL = config.apiBaseUrl;
+            console.log('Loaded config:', BASE_URL);
+        } catch (error) {
+            console.error('Failed to load config:', error);
+            BASE_URL = 'http://localhost:8000/api';
+        }
+    }
+
     const DEFAULT_SETTINGS = {
         min_hedge_size: 0.01,
         max_hedge_size: 100.0,
@@ -371,25 +386,33 @@
         const loader = showLoading();
         
         try {
+            // Ensure headers are properly set
+            const headers = {
+                'Content-Type': 'application/json',
+                ...options.headers
+            };
+            
             const response = await fetch(`${BASE_URL}${url}`, {
-                headers: {
-                    'Content-Type': 'application/json'
-                },
                 ...options,
+                headers,
                 body: options.body || undefined
             });
-    
+
+            // Log response for debugging
+            console.log(`API Response (${url}):`, response.status);
+            
             if (!response.ok) {
                 const errorData = await response.json();
                 throw new Error(errorData.error || 'API request failed');
             }
-    
+
             const data = await response.json();
             loader.remove();
             displayResponse(data);
             return data;
         } catch (error) {
             loader.remove();
+            console.error('API Call Error:', error);
             const errorMessage = error.message;
             displayResponse({
                 error: true,
@@ -709,7 +732,7 @@
 
     // Event Listeners
     document.getElementById('listPositionsBtn').addEventListener('click', () => makeApiCall('/positions'));
-    document.getElementById('getSoldPositionsBtn').addEventListener('click', () => makeApiCall('/positions/sold'));
+    //document.getElementById('getSoldPositionsBtn').addEventListener('click', () => makeApiCall('/positions/sold'));
     document.getElementById('getPositionBtn').addEventListener('click', () => {
         const positionId = document.getElementById('positionId').value;
         if (!positionId) {
@@ -814,17 +837,26 @@
         };
 
         try {
+            // Log the request for debugging
+            console.log('Sending settings update:', newSettings);
+            
             const response = await makeApiCall('/settings', {
                 method: 'PUT',
-                body: JSON.stringify(newSettings)
+                body: JSON.stringify(newSettings),
+                headers: {
+                    'Content-Type': 'application/json'
+                }
             });
 
             if (!response.error) {
                 currentSettings = newSettings;
                 hideSettingsModal();
                 showToast('Settings updated successfully');
+            } else {
+                showToast('Failed to update settings: ' + response.error, 'error');
             }
         } catch (error) {
+            console.error('Settings update error:', error);
             showToast('Failed to update settings', 'error');
         }
     });
@@ -839,8 +871,14 @@
 
     // Initialize
     document.addEventListener('DOMContentLoaded', async () => {
-        await loadSettings();
-        updateMonitoringStatus(false);
+        try {
+            await initializeConfig();  // Load config first
+            await loadSettings();      // Then load app settings
+            updateMonitoringStatus(false);
+        } catch (error) {
+            console.error('Initialization error:', error);
+            showToast('Failed to initialize application', 'error');
+        }
     });
 
     // Cleanup
